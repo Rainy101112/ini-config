@@ -4,16 +4,12 @@
  *  author: Rainy101112(https://github.com/Rainy101112)
  *  license: MIT license
  *
- *  No external test framework: the harness below is ~40 lines so that the
+ *  No external test framework: the harness below is ~60 lines so that the
  *  project keeps zero dependencies. Run with:
  *
  *      make test
  *      ./build/test_ini            # uses ./ as scratch dir
  *      INI_TEST_TMPDIR=/tmp ./build/test_ini
- *
- *  The suite pins down *current* behaviour. Cases marked "known limitation"
- *  assert the quirks documented in the README rather than ideal behaviour;
- *  update them when the parser is fixed.
  */
 
 #include <stdio.h>
@@ -123,7 +119,7 @@ static char *write_file(const char *name, const char *contents)
     return copy;
 }
 
-/* Load a config from an inline string. Returns 0 on success, -1 otherwise. */
+/* Load a config from an inline string. Returns 0 on success, negative on error. */
 static int load_string(ini_parser_t *parser, const char *name, const char *contents)
 {
     char *path = write_file(name, contents);
@@ -131,7 +127,7 @@ static int load_string(ini_parser_t *parser, const char *name, const char *conte
 
     if (path == NULL)
     {
-        return -1;
+        return INI_ERROR;
     }
 
     result = ini_parser_load(parser, path);
@@ -146,7 +142,9 @@ static int load_string(ini_parser_t *parser, const char *name, const char *conte
 
 static void test_basic(void)
 {
-    ini_parser_t parser = {0};
+    ini_parser_t parser;
+
+    ini_parser_init(&parser);
 
     CHECK_EQ(load_string(&parser,
                          "basic.ini",
@@ -177,7 +175,9 @@ static void test_basic(void)
 
 static void test_whitespace_and_tabs(void)
 {
-    ini_parser_t parser = {0};
+    ini_parser_t parser;
+
+    ini_parser_init(&parser);
 
     CHECK_EQ(load_string(&parser,
                          "ws.ini",
@@ -192,33 +192,35 @@ static void test_whitespace_and_tabs(void)
     ini_parser_free(&parser);
 }
 
-static void test_empty_and_quoted_values(void)
+static void test_empty_values(void)
 {
-    ini_parser_t parser = {0};
+    ini_parser_t parser;
+
+    ini_parser_init(&parser);
 
     CHECK_EQ(load_string(&parser,
                          "empty.ini",
                          "[s]\n"
                          "empty =\n"
                          "spaces =    \n"
-                         "quoted = \"  keep me  \"\n"),
+                         "equals = = value\n"),
              0);
 
     CHECK_STR(ini_parser_get(&parser, "s", "empty"), "");
     CHECK_STR(ini_parser_get(&parser, "s", "spaces"), "");
-    /* Quotes are not special: only outer whitespace is trimmed. */
-    CHECK_STR(ini_parser_get(&parser, "s", "quoted"), "\"  keep me  \"");
+    /* Only the first '=' splits the line. */
+    CHECK_STR(ini_parser_get(&parser, "s", "equals"), "= value");
 
     ini_parser_free(&parser);
 }
 
 static void test_equals_in_value(void)
 {
-    ini_parser_t parser = {0};
+    ini_parser_t parser;
+
+    ini_parser_init(&parser);
 
     CHECK_EQ(load_string(&parser, "equals.ini", "[s]\nurl = http://x/?a=1&b=2\n"), 0);
-
-    /* Only the first '=' splits; the rest belongs to the value. */
     CHECK_STR(ini_parser_get(&parser, "s", "url"), "http://x/?a=1&b=2");
 
     ini_parser_free(&parser);
@@ -230,7 +232,9 @@ static void test_equals_in_value(void)
 
 static void test_comments(void)
 {
-    ini_parser_t parser = {0};
+    ini_parser_t parser;
+
+    ini_parser_init(&parser);
 
     CHECK_EQ(load_string(&parser,
                          "comments.ini",
@@ -242,7 +246,9 @@ static void test_comments(void)
                          "e = # only a comment\n"
                          "f = 1\n"
                          "   ; a comment line inside a section\n"
-                         "g = 2\n"),
+                         "g = 2\n"
+                         "[commented]   ; header comment\n"
+                         "h = 3\n"),
              0);
 
     /* A comment marker preceded by whitespace starts an inline comment. */
@@ -255,17 +261,64 @@ static void test_comments(void)
     CHECK_STR(ini_parser_get(&parser, "s", "e"), "");
     CHECK_STR(ini_parser_get(&parser, "s", "f"), "1");
     CHECK_STR(ini_parser_get(&parser, "s", "g"), "2");
+    /* Comment after a section header is allowed. */
+    CHECK_STR(ini_parser_get(&parser, "commented", "h"), "3");
 
     ini_parser_free(&parser);
 }
 
 /* ------------------------------------------------------------------ */
-/* overriding and merging                                              */
+/* quoted values                                                       */
+/* ------------------------------------------------------------------ */
+
+static void test_quoted_values(void)
+{
+    ini_parser_t parser;
+
+    ini_parser_init(&parser);
+
+    CHECK_EQ(load_string(&parser,
+                         "quotes.ini",
+                         "[s]\n"
+                         "hash = \"a # b\"\n"
+                         "semi = 'x; y'\n"
+                         "apostrophe = it's fine\n"
+                         "bare = un\"quoted\n"
+                         "empty = \"\"\n"
+                         "inner = \"  keep  \"\n"
+                         "trailing = \"a\" ; note\n"
+                         "tight = \"a\"#b\n"
+                         "nospace=\"v\"\n"),
+             0);
+
+    /* Comment markers inside quotes are literal. */
+    CHECK_STR(ini_parser_get(&parser, "s", "hash"), "a # b");
+    CHECK_STR(ini_parser_get(&parser, "s", "semi"), "x; y");
+    /* An apostrophe that does not start a token is literal. */
+    CHECK_STR(ini_parser_get(&parser, "s", "apostrophe"), "it's fine");
+    /* Quotes in the middle of a value are left alone. */
+    CHECK_STR(ini_parser_get(&parser, "s", "bare"), "un\"quoted");
+    CHECK_STR(ini_parser_get(&parser, "s", "empty"), "");
+    /* Inner whitespace survives because it is inside the quotes. */
+    CHECK_STR(ini_parser_get(&parser, "s", "inner"), "  keep  ");
+    /* A comment after the closing quote is stripped. */
+    CHECK_STR(ini_parser_get(&parser, "s", "trailing"), "a");
+    /* No whitespace before '#': it stays, and the value is not fully quoted. */
+    CHECK_STR(ini_parser_get(&parser, "s", "tight"), "\"a\"#b");
+    CHECK_STR(ini_parser_get(&parser, "s", "nospace"), "v");
+
+    ini_parser_free(&parser);
+}
+
+/* ------------------------------------------------------------------ */
+/* overriding, merging, default section                                */
 /* ------------------------------------------------------------------ */
 
 static void test_duplicate_key_last_wins(void)
 {
-    ini_parser_t parser = {0};
+    ini_parser_t parser;
+
+    ini_parser_init(&parser);
 
     CHECK_EQ(load_string(&parser,
                          "dupkey.ini",
@@ -283,9 +336,11 @@ static void test_duplicate_key_last_wins(void)
 
 static void test_duplicate_section_merges(void)
 {
-    ini_parser_t parser = {0};
+    ini_parser_t parser;
     const ini_section_t *section;
     int count = 0;
+
+    ini_parser_init(&parser);
 
     CHECK_EQ(load_string(&parser,
                          "dupsection.ini",
@@ -307,20 +362,73 @@ static void test_duplicate_section_merges(void)
     ini_parser_free(&parser);
 }
 
+static void test_default_section(void)
+{
+    ini_parser_t parser;
+    const ini_section_t *section;
+    int count = 0;
+
+    ini_parser_init(&parser);
+
+    /* Keys before the first header land in INI_DEFAULT_SECTION. */
+    CHECK_EQ(load_string(&parser,
+                         "default.ini",
+                         "top = 1\n"
+                         "other = 2\n"
+                         "[s]\n"
+                         "a = 3\n"),
+             INI_OK);
+
+    CHECK_STR(ini_parser_get(&parser, INI_DEFAULT_SECTION, "top"), "1");
+    CHECK_STR(ini_parser_get(&parser, INI_DEFAULT_SECTION, "other"), "2");
+    CHECK_STR(ini_parser_get(&parser, "s", "a"), "3");
+
+    /* The default section is created once, and it comes first. */
+    CHECK(parser.sections != NULL);
+    if (parser.sections != NULL)
+    {
+        CHECK_STR(parser.sections->name, INI_DEFAULT_SECTION);
+    }
+
+    for (section = parser.sections; section != NULL; section = section->next)
+    {
+        count++;
+    }
+    CHECK_EQ(count, 2);
+
+    ini_parser_free(&parser);
+}
+
+static void test_default_section_only(void)
+{
+    ini_parser_t parser;
+
+    ini_parser_init(&parser);
+
+    /* A file without any header is now valid. */
+    CHECK_EQ(load_string(&parser, "noheader.ini", "a = 1\nb = 2\n"), INI_OK);
+    CHECK_STR(ini_parser_get(&parser, INI_DEFAULT_SECTION, "a"), "1");
+    CHECK_STR(ini_parser_get(&parser, INI_DEFAULT_SECTION, "b"), "2");
+
+    ini_parser_free(&parser);
+}
+
 /* ------------------------------------------------------------------ */
-/* line endings                                                        */
+/* line endings and line length                                        */
 /* ------------------------------------------------------------------ */
 
 static void test_crlf_and_no_final_newline(void)
 {
-    ini_parser_t parser = {0};
+    ini_parser_t parser;
+
+    ini_parser_init(&parser);
 
     CHECK_EQ(load_string(&parser,
                          "crlf.ini",
                          "[s]\r\n"
                          "a = 1\r\n"
                          "b = 2"),
-             0);
+             INI_OK);
 
     /* trim() drops the '\r' as trailing whitespace. */
     CHECK_STR(ini_parser_get(&parser, "s", "a"), "1");
@@ -329,16 +437,186 @@ static void test_crlf_and_no_final_newline(void)
     ini_parser_free(&parser);
 }
 
+static void test_long_lines_are_supported(void)
+{
+    static const size_t lengths[] = {126, 127, 128, 1023, 1024, 2000, 5000};
+    size_t i;
+
+    for (i = 0; i < sizeof(lengths) / sizeof(lengths[0]); i++)
+    {
+        ini_parser_t parser;
+        char name[32];
+        char *contents;
+        char *value;
+        size_t length = lengths[i];
+        size_t j;
+        size_t ok = 1;
+
+        ini_parser_init(&parser);
+
+        /* "[s]\nkey = " + length 'a's + "\n" */
+        contents = (char *)malloc(10 + length + 2);
+        if (contents == NULL)
+        {
+            CHECK(!"out of memory");
+            return;
+        }
+
+        memcpy(contents, "[s]\nkey = ", 10);
+        for (j = 0; j < length; j++)
+        {
+            contents[10 + j] = 'a';
+        }
+        contents[10 + length] = '\n';
+        contents[11 + length] = '\0';
+
+        snprintf(name, sizeof(name), "long_%lu.ini", (unsigned long)length);
+        CHECK_EQ(load_string(&parser, name, contents), INI_OK);
+
+        value = (char *)ini_parser_get(&parser, "s", "key");
+        if (value == NULL || strlen(value) != length)
+        {
+            ok = 0;
+        }
+        else
+        {
+            for (j = 0; j < length; j++)
+            {
+                if (value[j] != 'a')
+                {
+                    ok = 0;
+                    break;
+                }
+            }
+        }
+
+        g_checks++;
+        if (!ok)
+        {
+            fprintf(stderr, "FAIL %s:%d: long line of %lu bytes was truncated\n",
+                    __FILE__, __LINE__, (unsigned long)length);
+            g_failures++;
+        }
+
+        ini_parser_free(&parser);
+        free(contents);
+    }
+}
+
+static void test_many_long_lines(void)
+{
+    ini_parser_t parser;
+    char *contents;
+    const size_t count = 50;
+    const size_t value_length = 1500;
+    const size_t capacity = count * (value_length + 32) + 64;
+    size_t offset = 0;
+    size_t i;
+    size_t ok = 1;
+
+    ini_parser_init(&parser);
+
+    contents = (char *)malloc(capacity);
+    if (contents == NULL)
+    {
+        CHECK(!"out of memory");
+        return;
+    }
+
+    offset += (size_t)snprintf(contents + offset, capacity - offset, "[s]\n");
+    for (i = 0; i < count; i++)
+    {
+        size_t j;
+
+        offset += (size_t)snprintf(contents + offset, capacity - offset,
+                                   "key%lu = ", (unsigned long)i);
+        for (j = 0; j < value_length; j++)
+        {
+            contents[offset++] = (char)('a' + (i % 26));
+        }
+        contents[offset++] = '\n';
+    }
+    contents[offset] = '\0';
+
+    CHECK_EQ(load_string(&parser, "manylong.ini", contents), INI_OK);
+
+    for (i = 0; i < count; i++)
+    {
+        char key[32];
+        const char *value;
+
+        snprintf(key, sizeof(key), "key%lu", (unsigned long)i);
+        value = ini_parser_get(&parser, "s", key);
+        if (value == NULL || strlen(value) != value_length ||
+            value[0] != (char)('a' + (i % 26)))
+        {
+            ok = 0;
+        }
+    }
+
+    g_checks++;
+    if (!ok)
+    {
+        fprintf(stderr, "FAIL %s:%d: long multi-line file misparsed\n", __FILE__, __LINE__);
+        g_failures++;
+    }
+
+    ini_parser_free(&parser);
+    free(contents);
+}
+
+static void test_long_line_with_comment(void)
+{
+    ini_parser_t parser;
+    char *contents;
+    size_t offset = 0;
+    size_t i;
+
+    ini_parser_init(&parser);
+
+    contents = (char *)malloc(2100);
+    if (contents == NULL)
+    {
+        CHECK(!"out of memory");
+        return;
+    }
+
+    offset += (size_t)snprintf(contents + offset, 2100 - offset, "[s]\nkey = ");
+    for (i = 0; i < 2000; i++)
+    {
+        contents[offset++] = 'b';
+    }
+    contents[offset++] = ' ';
+    contents[offset++] = ';';
+    contents[offset++] = ' ';
+    contents[offset++] = 'c';
+    contents[offset++] = '\n';
+    contents[offset] = '\0';
+
+    CHECK_EQ(load_string(&parser, "longcomment.ini", contents), INI_OK);
+    CHECK(ini_parser_get(&parser, "s", "key") != NULL);
+    if (ini_parser_get(&parser, "s", "key") != NULL)
+    {
+        CHECK_EQ(strlen(ini_parser_get(&parser, "s", "key")), 2000);
+    }
+
+    ini_parser_free(&parser);
+    free(contents);
+}
+
 /* ------------------------------------------------------------------ */
 /* error handling                                                      */
 /* ------------------------------------------------------------------ */
 
 static void test_missing_file(void)
 {
-    ini_parser_t parser = {0};
+    ini_parser_t parser;
 
-    CHECK_EQ(ini_parser_load(&parser, "this/file/does/not/exist.ini"), -1);
+    ini_parser_init(&parser);
+
+    CHECK_EQ(ini_parser_load(&parser, "this/file/does/not/exist.ini"), INI_ERROR_OPEN);
     CHECK(parser.sections == NULL);
+    CHECK_EQ(parser.last_error, INI_ERROR_OPEN);
     CHECK(ini_parser_get(&parser, "s", "k") == NULL);
 
     ini_parser_free(&parser);
@@ -346,31 +624,30 @@ static void test_missing_file(void)
 
 static void test_syntax_errors(void)
 {
-    static const char *const cases[] = {
-        "[unclosed\nkey = 1\n",          /* missing ']'                  */
-        "[]\nkey = 1\n",                 /* empty section name           */
-        "key = 1\n",                     /* key before any section       */
-        "[s]\nnot a key value pair\n",   /* line without '='            */
-        "[s]\n = no key\n",              /* empty key                    */
+    static const struct
+    {
+        const char *contents;
+        int line;
+    } cases[] = {
+        {"[unclosed\nkey = 1\n", 1},         /* missing ']'          */
+        {"[s]\n[]\nkey = 1\n", 2},           /* empty section name   */
+        {"[s]\nnot a key value pair\n", 2},  /* line without '='     */
+        {"[s]\n = no key\n", 2},             /* empty key            */
+        {"[s]\nk = v\n[broken\n", 3},        /* error on the last line */
     };
     size_t i;
     char name[32];
 
     for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
     {
-        ini_parser_t parser = {0};
-        int result;
+        ini_parser_t parser;
+
+        ini_parser_init(&parser);
 
         snprintf(name, sizeof(name), "bad_%lu.ini", (unsigned long)i);
-        result = load_string(&parser, name, cases[i]);
-
-        if (result != -1)
-        {
-            fprintf(stderr, "FAIL: case %lu should have failed\n", (unsigned long)i);
-            fprintf(stderr, "  input: %s", cases[i]);
-            g_failures++;
-        }
-        g_checks++;
+        CHECK_EQ(load_string(&parser, name, cases[i].contents), INI_ERROR_SYNTAX);
+        CHECK_EQ(parser.last_error, INI_ERROR_SYNTAX);
+        CHECK_EQ(parser.last_error_line, cases[i].line);
 
         /* A failed load leaves the parser empty and still frees cleanly. */
         CHECK(parser.sections == NULL);
@@ -378,26 +655,119 @@ static void test_syntax_errors(void)
     }
 }
 
+static void test_error_state_reset_on_success(void)
+{
+    ini_parser_t parser;
+
+    ini_parser_init(&parser);
+
+    CHECK_EQ(load_string(&parser, "fail_first.ini", "[broken\n"), INI_ERROR_SYNTAX);
+    CHECK_EQ(parser.last_error, INI_ERROR_SYNTAX);
+    CHECK_EQ(parser.last_error_line, 1);
+
+    CHECK_EQ(load_string(&parser, "then_ok.ini", "[s]\nk = v\n"), INI_OK);
+    CHECK_EQ(parser.last_error, INI_OK);
+    CHECK_EQ(parser.last_error_line, 0);
+    CHECK_STR(ini_parser_get(&parser, "s", "k"), "v");
+
+    ini_parser_free(&parser);
+}
+
 static void test_null_arguments(void)
 {
-    ini_parser_t parser = {0};
+    ini_parser_t parser;
 
-    CHECK_EQ(ini_parser_load(NULL, "x.ini"), -1);
-    CHECK_EQ(ini_parser_load(&parser, NULL), -1);
+    ini_parser_init(&parser);
+
+    CHECK_EQ(ini_parser_load(NULL, "x.ini"), INI_ERROR_ARGUMENT);
+    CHECK_EQ(ini_parser_load(&parser, NULL), INI_ERROR_ARGUMENT);
 
     CHECK(ini_parser_get(NULL, "s", "k") == NULL);
     CHECK(ini_parser_get(&parser, NULL, "k") == NULL);
     CHECK(ini_parser_get(&parser, "s", NULL) == NULL);
 
+    ini_parser_init(NULL); /* must not crash */
     ini_parser_free(NULL); /* must not crash */
 
     ini_parser_free(&parser);
 }
 
+static void test_strerror(void)
+{
+    static const int statuses[] = {
+        INI_OK,        INI_ERROR,           INI_ERROR_ARGUMENT, INI_ERROR_OPEN,
+        INI_ERROR_READ, INI_ERROR_SYNTAX,   INI_ERROR_MEMORY,   INI_ERROR_NOT_FOUND,
+        INI_ERROR_TOO_SMALL, -999
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof(statuses) / sizeof(statuses[0]); i++)
+    {
+        const char *message = ini_strerror(statuses[i]);
+
+        CHECK(message != NULL);
+        if (message != NULL)
+        {
+            CHECK(message[0] != '\0');
+        }
+    }
+
+    CHECK_STR(ini_strerror(INI_OK), "success");
+}
+
+/* ------------------------------------------------------------------ */
+/* get_copy                                                            */
+/* ------------------------------------------------------------------ */
+
+static void test_get_copy(void)
+{
+    ini_parser_t parser;
+    char buffer[32];
+
+    ini_parser_init(&parser);
+
+    CHECK_EQ(load_string(&parser, "copy.ini", "[s]\nname = value\nempty =\n"), INI_OK);
+
+    memset(buffer, 'X', sizeof(buffer));
+    CHECK_EQ(ini_parser_get_copy(&parser, "s", "name", buffer, sizeof(buffer)), INI_OK);
+    CHECK_STR(buffer, "value");
+
+    /* Exact fit: length + 1 == out_size. */
+    memset(buffer, 'X', sizeof(buffer));
+    CHECK_EQ(ini_parser_get_copy(&parser, "s", "name", buffer, 6), INI_OK);
+    CHECK_STR(buffer, "value");
+
+    /* One byte short: truncated and NUL terminated. */
+    memset(buffer, 'X', sizeof(buffer));
+    CHECK_EQ(ini_parser_get_copy(&parser, "s", "name", buffer, 4), INI_ERROR_TOO_SMALL);
+    CHECK_STR(buffer, "val");
+
+    /* Empty value needs a single byte. */
+    CHECK_EQ(ini_parser_get_copy(&parser, "s", "empty", buffer, 1), INI_OK);
+    CHECK_STR(buffer, "");
+
+    /* Missing key clears the destination. */
+    memset(buffer, 'X', sizeof(buffer));
+    CHECK_EQ(ini_parser_get_copy(&parser, "s", "missing", buffer, sizeof(buffer)),
+             INI_ERROR_NOT_FOUND);
+    CHECK_STR(buffer, "");
+
+    CHECK_EQ(ini_parser_get_copy(&parser, "s", "name", NULL, 8), INI_ERROR_ARGUMENT);
+    CHECK_EQ(ini_parser_get_copy(&parser, "s", "name", buffer, 0), INI_ERROR_ARGUMENT);
+
+    ini_parser_free(&parser);
+}
+
+/* ------------------------------------------------------------------ */
+/* lifetime                                                            */
+/* ------------------------------------------------------------------ */
+
 static void test_reload_replaces_content(void)
 {
-    ini_parser_t parser = {0};
+    ini_parser_t parser;
     char *path = write_file("reload.ini", "[first]\na = 1\n");
+
+    ini_parser_init(&parser);
 
     CHECK(path != NULL);
     if (path == NULL)
@@ -405,7 +775,7 @@ static void test_reload_replaces_content(void)
         return;
     }
 
-    CHECK_EQ(ini_parser_load(&parser, path), 0);
+    CHECK_EQ(ini_parser_load(&parser, path), INI_OK);
     CHECK_STR(ini_parser_get(&parser, "first", "a"), "1");
 
     /* Overwrite the file and load again: the old contents must be gone. */
@@ -420,7 +790,7 @@ static void test_reload_replaces_content(void)
         }
     }
 
-    CHECK_EQ(ini_parser_load(&parser, path), 0);
+    CHECK_EQ(ini_parser_load(&parser, path), INI_OK);
     CHECK_STR(ini_parser_get(&parser, "second", "b"), "2");
     CHECK(ini_parser_get(&parser, "first", "a") == NULL);
 
@@ -431,9 +801,11 @@ static void test_reload_replaces_content(void)
 
 static void test_free_is_idempotent(void)
 {
-    ini_parser_t parser = {0};
+    ini_parser_t parser;
 
-    CHECK_EQ(load_string(&parser, "free.ini", "[s]\nk = v\n"), 0);
+    ini_parser_init(&parser);
+
+    CHECK_EQ(load_string(&parser, "free.ini", "[s]\nk = v\n"), INI_OK);
     CHECK_STR(ini_parser_get(&parser, "s", "k"), "v");
 
     ini_parser_free(&parser);
@@ -444,58 +816,11 @@ static void test_free_is_idempotent(void)
 
     ini_parser_free(&parser); /* second free must be harmless */
     CHECK(parser.sections == NULL);
-}
 
-/* ------------------------------------------------------------------ */
-/* known limitations                                                   */
-/* ------------------------------------------------------------------ */
-
-/*
- * Lines longer than the parser's internal 1024-byte fgets() buffer are split
- * in two. The tail usually has no '=', so the load fails with -1 instead of
- * silently truncating the value. Assert that, so that fixing the buffer size
- * (or switching to getline) makes this test fail loudly and get updated.
- */
-static void test_long_line_fails_the_load(void)
-{
-    ini_parser_t parser = {0};
-    char *contents;
-    size_t i;
-    size_t length = 2000;
-
-    contents = (char *)malloc(length + 16);
-    CHECK(contents != NULL);
-    if (contents == NULL)
-    {
-        return;
-    }
-
-    memcpy(contents, "[s]\nkey = ", 10);
-    for (i = 0; i < length; i++)
-    {
-        contents[10 + i] = 'a';
-    }
-    contents[10 + length] = '\n';
-    contents[11 + length] = '\0';
-
-    CHECK_EQ(load_string(&parser, "longline.ini", contents), -1);
-    CHECK(parser.sections == NULL);
-
-    ini_parser_free(&parser);
-    free(contents);
-}
-
-/*
- * A comment marker that follows whitespace inside a quoted value still starts
- * a comment, because the parser has no concept of quotes.
- */
-static void test_quotes_do_not_protect_comment_markers(void)
-{
-    ini_parser_t parser = {0};
-
-    CHECK_EQ(load_string(&parser, "quote_comment.ini", "[s]\nmsg = \"a # b\"\n"), 0);
-
-    CHECK_STR(ini_parser_get(&parser, "s", "msg"), "\"a");
+    /* A freed parser can be reused, including after init. */
+    ini_parser_init(&parser);
+    CHECK_EQ(load_string(&parser, "reuse.ini", "[s]\nk = v2\n"), INI_OK);
+    CHECK_STR(ini_parser_get(&parser, "s", "k"), "v2");
 
     ini_parser_free(&parser);
 }
@@ -519,19 +844,26 @@ int main(int argc, char **argv)
 
     test_basic();
     test_whitespace_and_tabs();
-    test_empty_and_quoted_values();
+    test_empty_values();
     test_equals_in_value();
     test_comments();
+    test_quoted_values();
     test_duplicate_key_last_wins();
     test_duplicate_section_merges();
+    test_default_section();
+    test_default_section_only();
     test_crlf_and_no_final_newline();
+    test_long_lines_are_supported();
+    test_many_long_lines();
+    test_long_line_with_comment();
     test_missing_file();
     test_syntax_errors();
+    test_error_state_reset_on_success();
     test_null_arguments();
+    test_strerror();
+    test_get_copy();
     test_reload_replaces_content();
     test_free_is_idempotent();
-    test_long_line_fails_the_load();
-    test_quotes_do_not_protect_comment_markers();
 
     printf("\n%d checks, %d failure(s)\n", g_checks, g_failures);
     return (g_failures == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
