@@ -10,6 +10,7 @@
 #define INCLUDE_INI_H_
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -38,18 +39,35 @@ typedef struct ini_key ini_key_t;
 typedef struct ini_section ini_section_t;
 typedef struct ini_parser ini_parser_t;
 
+/*
+ * The structs below are public so that a parsed file can be iterated without
+ * extra API. Fields marked "internal" are owned by the parser: read them if
+ * you like, but do not modify them or rely on their layout.
+ *
+ * Iteration order is the order of appearance in the file, and is independent
+ * of the hash index used for lookups:
+ *
+ *   for (s = parser->sections; s; s = s->next)
+ *       for (k = s->head; k; k = k->next)
+ */
 struct ini_key
 {
     char *name;
     char *value;
-    ini_key_t *next;
+    ini_key_t *next;      /* next key in file order            */
+    ini_key_t *hash_next; /* internal: next key in the same bucket */
 };
 
 struct ini_section
 {
     char *name;
     ini_key_t *head;
-    ini_section_t *next;
+    ini_section_t *next;      /* next section in file order           */
+    ini_key_t *tail;          /* internal: last key, for O(1) append  */
+    ini_section_t *hash_next; /* internal: next section in the bucket */
+    ini_key_t **key_buckets;  /* internal: hash index over keys       */
+    size_t key_bucket_count;  /* internal: number of buckets, 0 if none */
+    size_t key_count;         /* internal: number of keys             */
 };
 
 struct ini_parser
@@ -57,6 +75,16 @@ struct ini_parser
     ini_section_t *sections;
     int last_error;      /* ini_status_t of the most recent failure, INI_OK if none */
     int last_error_line; /* 1-based line of the most recent syntax/read failure     */
+
+    /* internal: hash index over sections, kept sorted-independent of order */
+    ini_section_t *tail;              /* last section, for O(1) append */
+    ini_section_t **section_buckets;  /* hash index over sections      */
+    size_t section_bucket_count;      /* number of buckets, 0 if none  */
+    size_t section_count;             /* number of sections            */
+
+    /* internal: keyed hash secret (SipHash-2-4), see ini_parser_set_hash_seed */
+    uint64_t hash_key[2];
+    int hash_seeded;
 };
 
 /* Zero a parser before first use. ini_parser_load() also works on a zero
@@ -87,6 +115,20 @@ void ini_parser_free(ini_parser_t *parser);
 
 /* Human readable description of an ini_status_t value; never NULL. */
 const char *ini_strerror(int status);
+
+/*
+ * Override the per-parser hash key.
+ *
+ * By default every parser draws a fresh 128 bit key the first time a file is
+ * loaded, so an attacker who controls the configuration file cannot precompute
+ * key names that all collide. Pass a value from your own CSPRNG if you want to
+ * be independent of the library's entropy source, or a fixed value to make
+ * behaviour reproducible (tests, reproducible builds).
+ *
+ * Safe to call at any time: an already populated parser is re-indexed in place
+ * without allocating, and the file order is not affected.
+ */
+void ini_parser_set_hash_seed(ini_parser_t *parser, uint64_t seed0, uint64_t seed1);
 
 #ifdef __cplusplus
 }
